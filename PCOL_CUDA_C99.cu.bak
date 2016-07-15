@@ -1,7 +1,6 @@
 // PCOL_OMP_C99.cpp : Defines the entry point for the console application.
-
-
-/*{An in-house code which solves the steady Navier-Stokes equations,
+//
+/*{A GPU accelerated in-house code which solves the steady Navier-Stokes equations,
    using the Finite Volume Method (FVM) in primitive variables formulation.
    Convective terms are discretized using second order central differencing scheme,
    and SIMPLE algorithm are used to decouple velocity and pressure. 
@@ -19,8 +18,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.*/
 
-
-#include "stdafx.h"
+#include <stdlib.h>
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -29,10 +27,84 @@ limitations under the License.*/
 #include <iomanip>
 #include <Windows.h>
 #include <omp.h>
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
 
 using namespace std;
 
-int _tmain(int argc, _TCHAR* argv[])
+
+
+__global__ void Forwardsub(double *RES, double *LS, double *LW, double *LPR, int NI, int NJ, int Start, int J, int threads)
+{
+	int i = blockIdx.x*blockDim.x + threadIdx.x;
+	if (i < threads)
+	{
+		int IJ = ((Start + i)*NI) + (J - (Start + i));
+		//printf(" %d ", IJ);
+		RES[IJ] = (RES[IJ] - LS[IJ] * RES[IJ - 1] - LW[IJ] * RES[IJ - NJ])*LPR[IJ];
+	}
+
+}
+
+__global__ void Forward(double *D_RES, double *D_LS, double *D_LW, double *D_LPR, int NI, int NJ, int thrds)
+{
+	int threads;
+	for (int J = 2; J <= (NI + NI - 2); ++J)
+	{
+		int Start = max(1, J - NI + 2);
+		int End = min(NI - 2, J - 1);
+
+		threads = End - Start + 1;
+		dim3 block(thrds);
+		dim3 grid((threads + block.x - 1) / block.x);
+
+		if ((End - Start + 1) > 0)
+		{
+			Forwardsub << <grid, block >> >(D_RES, D_LS, D_LW, D_LPR, NI, NJ, Start, J, threads);
+			cudaDeviceSynchronize();
+		}
+	}
+}
+
+__global__ void Backwardsub(double *U, double *RES, double *UN, double *UE, double *LPR, int NI, int NJ, int End, int J, int threads)
+{
+	int i = blockIdx.x*blockDim.x + threadIdx.x;
+	if (i < threads)
+	{
+		int IJ = ((End - i)*NI) + (J - (End - i));
+		RES[IJ] = RES[IJ] - UN[IJ] * RES[IJ + 1] - UE[IJ] * RES[IJ + NJ];
+		U[IJ] = U[IJ] + RES[IJ];
+	}
+}
+
+__global__ void Backward(double *D_U, double *D_RES, double *D_UN, double *D_UE, double *D_LPR, int NI, int NJ, int thrds)
+{
+	int threads;
+	for (int J = (NI + NI - 2); J >= 2; --J)
+	{
+		int Start = max(1, J - NI + 2);
+		int End = min(NI - 2, J - 1);
+
+		threads = End - Start + 1;
+		dim3 block(thrds);
+		dim3 grid((threads + block.x - 1) / block.x);
+
+		if ((End - Start + 1) > 0)
+		{
+			Backwardsub << <grid, block >> >(D_U, D_RES, D_UN, D_UE, D_LPR, NI, NJ, End, J, threads);
+			cudaDeviceSynchronize();
+		}
+	}
+}
+
+__global__ void UpdateU(double *U, double *RES)
+{
+	int IJ = threadIdx.x;
+	U[IJ] = U[IJ] + RES[IJ];
+
+}
+
+int main()
 {
 
 	////////////////
@@ -43,17 +115,20 @@ int _tmain(int argc, _TCHAR* argv[])
 	ifstream INPUTFILE;
 	INPUTFILE.open("Input.txt");
 
-	omp_set_num_threads(12);
+
+	int thrds = 64;
+	int bkthrds = 32;
+
 
 	double XMIN, XMAX;					// Positional limits of the solution domain
 	double EXX;							// EXX: Grid Expansion Factor in x-direction
-	int N=101;								// NI: No. of control volumes in x-direction
+	int N = 101;								// NI: No. of control volumes in x-direction
 	int NI;							// NIM: No. of nodes is x-direction
 	int NIM;
 	double DX;							// DX: Distance between two consecutive nodes
 	double YMIN, YMAX;					// Positional limits of the solution domain
 	double EXY;							// EXY: Grid Expansion Factor in y-direction
-	int M=101;								// NJ: No. of control volumes in y-direction
+	int M = 101;								// NJ: No. of control volumes in y-direction
 	int NJ;							// NJM: No. of nodes is y-direction
 	int NJM;
 	double DY;							// DY: Distance between two consecutive nodes
@@ -101,6 +176,7 @@ int _tmain(int argc, _TCHAR* argv[])
 	// in case convergence problems are encountered.
 	double TIME;						// TIME: Time step
 	double SOURCE, RESOR, RSMU, RSMV, RSMP, RSMT;
+	RSMU = RSMV = RSMP = RSMT = 0.0;
 	double progress = 0.0;
 	string SLTIME, SLCALIEN;
 	string InterSave, InterRead;
@@ -296,7 +372,7 @@ int _tmain(int argc, _TCHAR* argv[])
 	// Define The Grid //
 	/////////////////////
 
-	
+
 
 	/**************************************************************/
 
@@ -324,7 +400,7 @@ int _tmain(int argc, _TCHAR* argv[])
 
 	double *XC;
 	XC = (double*)malloc(NI*sizeof(double));			// XC: Vector storing the X-position of cell centers
-	
+
 
 	XC[0] = X[0];
 	for (int i = 1; i < NIM; ++i)
@@ -349,7 +425,7 @@ int _tmain(int argc, _TCHAR* argv[])
 	double *Y;
 	Y = (double*)malloc(NJ*sizeof(double));			// Y: Vector storing the Y-position of nodes
 
-	
+
 
 	if (EXY == 1)
 		DY = (YMAX - YMIN) / M;
@@ -385,7 +461,7 @@ int _tmain(int argc, _TCHAR* argv[])
 	/* Set Radius R=1 for Plane */
 
 	double *R;
-	R = (double*)malloc(NJ*sizeof(double));				
+	R = (double*)malloc(NJ*sizeof(double));
 
 	for (int j = 0; j < NJ; ++j)
 	{
@@ -431,9 +507,26 @@ int _tmain(int argc, _TCHAR* argv[])
 	LARGE_INTEGER StartingTimeV, EndingTimeV, ElapsedMicrosecondsV;
 	LARGE_INTEGER StartingTimeP, EndingTimeP, ElapsedMicrosecondsP;
 	LARGE_INTEGER StartingTimeT, EndingTimeT, ElapsedMicrosecondsT;
+
+	LARGE_INTEGER StartingTimeTU, EndingTimeTU, ElapsedMicrosecondsTU;
+	LARGE_INTEGER StartingTimeTV, EndingTimeTV, ElapsedMicrosecondsTV;
+	LARGE_INTEGER StartingTimeTP, EndingTimeTP, ElapsedMicrosecondsTP;
+	LARGE_INTEGER StartingTimeTT, EndingTimeTT, ElapsedMicrosecondsTT;
+
+	LARGE_INTEGER StartingTimeSU, EndingTimeSU, ElapsedMicrosecondsSU;
+	LARGE_INTEGER StartingTimeSV, EndingTimeSV, ElapsedMicrosecondsSV;
+	LARGE_INTEGER StartingTimeSP, EndingTimeSP, ElapsedMicrosecondsSP;
+	LARGE_INTEGER StartingTimeST, EndingTimeST, ElapsedMicrosecondsST;
+
 	LARGE_INTEGER Frequency;
 	double TIMEU, TIMEV, TIMEP, TIMET;
 	TIMEU = TIMEV = TIMEP = TIMET = 0.0;
+
+	double TIMETU, TIMETV, TIMETP, TIMETT;
+	TIMETU = TIMETV = TIMETP = TIMETT = 0.0;
+
+	double TIMESU, TIMESV, TIMESP, TIMEST;
+	TIMESU = TIMESV = TIMESP = TIMEST = 0.0;
 
 
 	double SMALL = 0.000000000000000000000000000001;
@@ -502,7 +595,7 @@ int _tmain(int argc, _TCHAR* argv[])
 	VOO = (double*)malloc(NIJ*sizeof(double));
 	POO = (double*)malloc(NIJ*sizeof(double));
 	TOO = (double*)malloc(NIJ*sizeof(double));
-	
+
 	double *AN, *AS, *AE, *AW, *AP;
 	AN = (double*)malloc(NIJ*sizeof(double));
 	AS = (double*)malloc(NIJ*sizeof(double));
@@ -520,6 +613,24 @@ int _tmain(int argc, _TCHAR* argv[])
 	LPR = (double*)malloc(NIJ*sizeof(double));
 
 	double P1, P2, RESL, RSM;
+
+
+	double  *D_RES, *D_LS, *D_LW, *D_UN, *D_UE, *D_LPR;
+
+	cudaMalloc(&D_RES, NIJ*sizeof(double));
+	cudaMalloc(&D_LS, NIJ*sizeof(double));
+	cudaMalloc(&D_UN, NIJ*sizeof(double));
+	cudaMalloc(&D_UE, NIJ*sizeof(double));
+	cudaMalloc(&D_LW, NIJ*sizeof(double));
+	cudaMalloc(&D_LPR, NIJ*sizeof(double));
+
+	double  *D_U, *D_V, *D_PP, *D_T;
+
+	cudaMalloc(&D_U, NIJ*sizeof(double));
+	cudaMalloc(&D_V, NIJ*sizeof(double));
+	cudaMalloc(&D_PP, NIJ*sizeof(double));
+	cudaMalloc(&D_T, NIJ*sizeof(double));
+
 
 	/*******************************************/
 
@@ -874,8 +985,8 @@ int _tmain(int argc, _TCHAR* argv[])
 
 					FUUDS = CP*U[IJ] + CE*U[IJE];
 					FVUDS = CP*V[IJ] + CE*V[IJE];
-					FUCDS = F1[IJ]*(U[IJE]*FXE + U[IJ]*FXP);
-					FVCDS = F1[IJ]*(V[IJE]*FXE + V[IJ]*FXP);
+					FUCDS = F1[IJ] * (U[IJE] * FXE + U[IJ] * FXP);
+					FVCDS = F1[IJ] * (V[IJE] * FXE + V[IJ] * FXP);
 
 					/* COEFFICIENTS AE(P) AND AW(E) DUE TO UDS */
 
@@ -928,8 +1039,8 @@ int _tmain(int argc, _TCHAR* argv[])
 
 					FVUDS = CP*V[IJ] + CN*V[IJN];
 					FUUDS = CP*U[IJ] + CN*U[IJN];
-					FUCDS = F2[IJ]*(U[IJN]*FYN + U[IJ]*FYP);
-					FVCDS = F2[IJ]*(V[IJN]*FYN + V[IJ]*FYP);
+					FUCDS = F2[IJ] * (U[IJN] * FYN + U[IJ] * FYP);
+					FVCDS = F2[IJ] * (V[IJN] * FYN + V[IJ] * FYP);
 
 					/* COEFFICIENTS AN(P) AND AS(N) DUE TO UDS */
 
@@ -968,14 +1079,14 @@ int _tmain(int argc, _TCHAR* argv[])
 
 					/* CELL-FACE PRESSURE, CELL-CENTER GRADIENT, SOURCE */
 
-					PE = P[IJ + NJ]*FX[I] + P[IJ]*(1.0 - FX[I]);
-					PW = P[IJ]*FX[I - 1] + P[IJ - NJ]*(1.0 - FX[I - 1]);
-					PN = P[IJ + 1]*FY[J] + P[IJ]*(1.0 - FY[J]);
-					PS = P[IJ]*FY[J - 1] + P[IJ - 1]*(1.0 - FY[J - 1]);
+					PE = P[IJ + NJ] * FX[I] + P[IJ] * (1.0 - FX[I]);
+					PW = P[IJ] * FX[I - 1] + P[IJ - NJ] * (1.0 - FX[I - 1]);
+					PN = P[IJ + 1] * FY[J] + P[IJ] * (1.0 - FY[J]);
+					PS = P[IJ] * FY[J - 1] + P[IJ - 1] * (1.0 - FY[J - 1]);
 					DPX[IJ] = (PE - PW) / DX;
 					DPY[IJ] = (PN - PS) / DY;
-					SU[IJ] = SU[IJ] - DPX[IJ]*VOL;
-					SV[IJ] = SV[IJ] - DPY[IJ]*VOL;
+					SU[IJ] = SU[IJ] - DPX[IJ] * VOL;
+					SV[IJ] = SV[IJ] - DPY[IJ] * VOL;
 
 					/* BUOYANCY SOURCE CONTRIBUTION */
 
@@ -1066,7 +1177,7 @@ int _tmain(int argc, _TCHAR* argv[])
 				for (int IJ = (LI[I] + 1); IJ < (LI[I] + NJM); ++IJ)
 				{
 					AP[IJ] = (-AE[IJ] - AW[IJ] - AN[IJ] - AS[IJ] + APU[IJ])*URFUR;
-					SU[IJ] = SU[IJ] + (1.0 - URFU)*AP[IJ]*U[IJ];
+					SU[IJ] = SU[IJ] + (1.0 - URFU)*AP[IJ] * U[IJ];
 					APU[IJ] = 1.0 / AP[IJ];
 				}
 			}
@@ -1084,6 +1195,8 @@ int _tmain(int argc, _TCHAR* argv[])
 			// SIPSOL //
 			////////////
 
+
+
 			/* COEFFICIENTS OF UPPER AND LOWER TRIANGULAR MATRICES */
 
 			for (int I = 1; I < NIM; ++I)
@@ -1092,13 +1205,31 @@ int _tmain(int argc, _TCHAR* argv[])
 				{
 					LW[IJ] = AW[IJ] / (1.0 + ALFA*UN[IJ - NJ]);
 					LS[IJ] = AS[IJ] / (1.0 + ALFA*UE[IJ - 1]);
-					P1 = ALFA*LW[IJ]*UN[IJ - NJ];
-					P2 = ALFA*LS[IJ]*UE[IJ - 1];
-					LPR[IJ] = 1.0 / (AP[IJ] + P1 + P2 - LW[IJ]*UE[IJ - NJ] - LS[IJ]*UN[IJ - 1]);
+					P1 = ALFA*LW[IJ] * UN[IJ - NJ];
+					P2 = ALFA*LS[IJ] * UE[IJ - 1];
+					LPR[IJ] = 1.0 / (AP[IJ] + P1 + P2 - LW[IJ] * UE[IJ - NJ] - LS[IJ] * UN[IJ - 1]);
 					UN[IJ] = (AN[IJ] - P1)*LPR[IJ];
 					UE[IJ] = (AE[IJ] - P2)*LPR[IJ];
 				}
 			}
+
+			/****************************************************/
+			QueryPerformanceCounter(&StartingTimeTU);
+			/***************************************************/
+			cudaMemcpy(D_LS, LS, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_LW, LW, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_UN, UN, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_UE, UE, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_LPR, LPR, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_U, U, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			/*******************************************************************************/
+			QueryPerformanceCounter(&EndingTimeTU);
+			ElapsedMicrosecondsTU.QuadPart = EndingTimeTU.QuadPart - StartingTimeTU.QuadPart;
+			ElapsedMicrosecondsTU.QuadPart *= 1000000;
+			ElapsedMicrosecondsTU.QuadPart /= Frequency.QuadPart;
+			TIMETU += ElapsedMicrosecondsTU.QuadPart;
+			/*********************************************************************************/
+
 
 			/* INNER ITERATIONS LOOP*/
 
@@ -1112,30 +1243,22 @@ int _tmain(int argc, _TCHAR* argv[])
 				{
 					int Start = (LI[I] + 1);
 					int End = (LI[I] + NJM);
-#pragma omp parallel for reduction (+:RESL) 
+
 					for (int IJ = Start; IJ < End; ++IJ)
 					{
-						RES[IJ] = SU[IJ] - AN[IJ]*U[IJ + 1] - AS[IJ]*U[IJ - 1] -
-							AE[IJ]*U[IJ + NJ] - AW[IJ]*U[IJ - NJ] - AP[IJ]*U[IJ];
+						RES[IJ] = SU[IJ] - AN[IJ] * U[IJ + 1] - AS[IJ] * U[IJ - 1] -
+							AE[IJ] * U[IJ + NJ] - AW[IJ] * U[IJ - NJ] - AP[IJ] * U[IJ];
 
 						double ABS = abs(RES[IJ]);
 						RESL += ABS;
 					}
 				}
 
-				for (int J = 2; J <= (NI + NI - 2); ++J)
-				{
-					int Start = max(1, J - NI + 2);
-					int End = min(NI - 2, J - 1);
 
-#pragma omp parallel for if ((End-Start)>50) 
-					for (int I = Start; I <= End; ++I)
-					{
-						int IJ = (I*NI) + (J - I);
-						RES[IJ] = (RES[IJ] - LS[IJ]*RES[IJ - 1] - LW[IJ]*RES[IJ - NJ])*LPR[IJ];
-					}
-				}
+				cudaMemcpy(D_RES, RES, NIJ*sizeof(double), cudaMemcpyHostToDevice);
 
+
+				Forward << <1, 1 >> >(D_RES, D_LS, D_LW, D_LPR, NI, NJ, thrds);
 
 				/* STORE INITIAL RESIDUAL SUM FOR CHECKING CONV. OF OUTER ITER. */
 
@@ -1148,19 +1271,11 @@ int _tmain(int argc, _TCHAR* argv[])
 
 				/* BACK SUBSTITUTION AND CORRECTION */
 
-				for (int J = (NI + NI - 2); J >= 2; --J)
-				{
-					int Start = max(1, J - NI + 2);
-					int End = min(NI - 2, J - 1);
+				Backward << <1, 1 >> >(D_U, D_RES, D_UN, D_UE, D_LPR, NI, NJ, thrds);
 
-#pragma omp parallel for if ((End-Start)>50)
-					for (int I = End; I >= Start; --I)
-					{
-						int IJ = (I*NI) + (J - I);
-						RES[IJ] = RES[IJ] - UN[IJ]*RES[IJ + 1] - UE[IJ]*RES[IJ + NJ];
-						U[IJ] = U[IJ] + RES[IJ];
-					}
-				}				
+
+				cudaMemcpy(U, D_U, NIJ*sizeof(double), cudaMemcpyDeviceToHost);
+
 
 				RSMU = RESOR;
 
@@ -1171,16 +1286,14 @@ int _tmain(int argc, _TCHAR* argv[])
 
 			}
 
+
+
 			/*******************************************************************************/
-
-
-
 			QueryPerformanceCounter(&EndingTimeU);
 			ElapsedMicrosecondsU.QuadPart = EndingTimeU.QuadPart - StartingTimeU.QuadPart;
 			ElapsedMicrosecondsU.QuadPart *= 1000000;
 			ElapsedMicrosecondsU.QuadPart /= Frequency.QuadPart;
 			TIMEU += ElapsedMicrosecondsU.QuadPart;
-
 			/*********************************************************************************/
 
 			/* UNDER-RELAXATION, SOLVING EQUATION SYSTEM FOR V-VELOCITY */
@@ -1190,7 +1303,7 @@ int _tmain(int argc, _TCHAR* argv[])
 				for (int IJ = (LI[I] + 1); IJ < (LI[I] + NJM); ++IJ)
 				{
 					AP[IJ] = (-AE[IJ] - AW[IJ] - AN[IJ] - AS[IJ] + APV[IJ])*URFVR;
-					SU[IJ] = SV[IJ] + (1.0 - URFV)*AP[IJ]*V[IJ];
+					SU[IJ] = SV[IJ] + (1.0 - URFV)*AP[IJ] * V[IJ];
 					APV[IJ] = 1.0 / AP[IJ];
 				}
 			}
@@ -1217,13 +1330,21 @@ int _tmain(int argc, _TCHAR* argv[])
 				{
 					LW[IJ] = AW[IJ] / (1.0 + ALFA*UN[IJ - NJ]);
 					LS[IJ] = AS[IJ] / (1.0 + ALFA*UE[IJ - 1]);
-					P1 = ALFA*LW[IJ]*UN[IJ - NJ];
-					P2 = ALFA*LS[IJ]*UE[IJ - 1];
-					LPR[IJ] = 1.0 / (AP[IJ] + P1 + P2 - LW[IJ]*UE[IJ - NJ] - LS[IJ]*UN[IJ - 1]);
+					P1 = ALFA*LW[IJ] * UN[IJ - NJ];
+					P2 = ALFA*LS[IJ] * UE[IJ - 1];
+					LPR[IJ] = 1.0 / (AP[IJ] + P1 + P2 - LW[IJ] * UE[IJ - NJ] - LS[IJ] * UN[IJ - 1]);
 					UN[IJ] = (AN[IJ] - P1)*LPR[IJ];
 					UE[IJ] = (AE[IJ] - P2)*LPR[IJ];
 				}
 			}
+
+			cudaMemcpy(D_LS, LS, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_LW, LW, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_UN, UN, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_UE, UE, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_LPR, LPR, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_V, V, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+
 
 			/* INNER ITERATIONS LOOP*/
 
@@ -1237,29 +1358,38 @@ int _tmain(int argc, _TCHAR* argv[])
 				{
 					int Start = (LI[I] + 1);
 					int End = (LI[I] + NJM);
-#pragma omp parallel for reduction (+:RESL)
+
 					for (int IJ = Start; IJ < End; ++IJ)
 					{
-						RES[IJ] = SU[IJ] - AN[IJ]*V[IJ + 1] - AS[IJ]*V[IJ - 1] -
-							AE[IJ]*V[IJ + NJ] - AW[IJ]*V[IJ - NJ] - AP[IJ]*V[IJ];
+						RES[IJ] = SU[IJ] - AN[IJ] * V[IJ + 1] - AS[IJ] * V[IJ - 1] -
+							AE[IJ] * V[IJ + NJ] - AW[IJ] * V[IJ - NJ] - AP[IJ] * V[IJ];
 
 						double ABS = abs(RES[IJ]);
 						RESL += ABS;
 					}
 				}
 
-				for (int J = 2; J <= (NI + NI - 2); ++J)
-				{
-					int Start = max(1, J - NI + 2);
-					int End = min(NI - 2, J - 1);
+				cudaMemcpy(D_RES, RES, NIJ*sizeof(double), cudaMemcpyHostToDevice);
 
-#pragma omp parallel for if ((End-Start)>50) 
-					for (int I = Start; I <= End; ++I)
-					{
-						int IJ = (I*NI) + (J - I);
-						RES[IJ] = (RES[IJ] - LS[IJ]*RES[IJ - 1] - LW[IJ]*RES[IJ - NJ])*LPR[IJ];
-					}
+				int threads;
+
+				/*for (int J = 2; J <= (NI + NI - 2); ++J)
+				{
+				int Start = max(1, J - NI + 2);
+				int End = min(NI - 2, J - 1);
+
+				threads = End - Start + 1;
+				dim3 block(thrds);
+				dim3 grid((threads + block.x - 1) / block.x);
+
+				if ((End - Start + 1) > 0)
+				{
+				Forwardsub << <grid, block >> >(D_RES, D_LS, D_LW, D_LPR, NI, NJ, Start, J, threads);
+				cudaDeviceSynchronize();
 				}
+				}*/
+
+				Forward << <1, 1 >> >(D_RES, D_LS, D_LW, D_LPR, NI, NJ, thrds);
 
 
 				/* STORE INITIAL RESIDUAL SUM FOR CHECKING CONV. OF OUTER ITER. */
@@ -1273,19 +1403,37 @@ int _tmain(int argc, _TCHAR* argv[])
 
 				/* BACK SUBSTITUTION AND CORRECTION */
 
-				for (int J = (NI + NI - 2); J >= 2; --J)
+				/*for (int J = (NI + NI - 2); J >= 2; --J)
 				{
-					int Start = max(1, J - NI + 2);
-					int End = min(NI - 2, J - 1);
+				int Start = max(1, J - NI + 2);
+				int End = min(NI - 2, J - 1);
 
-#pragma omp parallel for if ((End-Start)>50)
-					for (int I = End; I >= Start; --I)
-					{
-						int IJ = (I*NI) + (J - I);
-						RES[IJ] = RES[IJ] - UN[IJ]*RES[IJ + 1] - UE[IJ]*RES[IJ + NJ];
-						V[IJ] = V[IJ] + RES[IJ];
-					}
-				}				
+				threads = End - Start + 1;
+				dim3 block(thrds);
+				dim3 grid((threads + block.x - 1) / block.x);
+
+
+				if ((End - Start + 1) > 0)
+				{
+				Backwardsub << <grid, block >> >(D_V, D_RES, D_UN, D_UE, D_LPR, NI, NJ, End, J, threads);
+				cudaDeviceSynchronize();
+				}
+				}*/
+
+				Backward << <1, 1 >> >(D_V, D_RES, D_UN, D_UE, D_LPR, NI, NJ, thrds);
+
+				cudaMemcpy(V, D_V, NIJ*sizeof(double), cudaMemcpyDeviceToHost);
+
+				/*for (int I = (NIM - 1); I > 0; --I)
+				{
+				int Start = (LI[I] + NJM - 1);
+				int End = (LI[I] + 1);
+
+				for (int IJ = Start; IJ >= End; --IJ)
+				{
+				V[IJ] = V[IJ] + RES[IJ];
+				}
+				}*/
 
 				RSMV = RESOR;
 
@@ -1344,8 +1492,8 @@ int _tmain(int argc, _TCHAR* argv[])
 					to achieve second order accuracy at cell face center. */
 
 					DPXEL = 0.5*(DPX[IJE] + DPX[IJ]);
-					UEL = U[IJE]*FXE + U[IJ]*FXP;
-					APUE = APU[IJE]*FXE + APU[IJ]*FXP;
+					UEL = U[IJE] * FXE + U[IJ] * FXP;
+					APUE = APU[IJE] * FXE + APU[IJ] * FXP;
 
 					/* CELL FACE GRADIENT, VELOCITY AND MASS FLUX */
 
@@ -1380,8 +1528,8 @@ int _tmain(int argc, _TCHAR* argv[])
 					/* INTERPOLATED CELL-FACE QUANTITIES (PRESSURE GRAD., U AND 1/AP) */
 
 					DPYNL = 0.5*(DPY[IJN] + DPY[IJ]);
-					VNL = V[IJN]*FYN + V[IJ]*FYP;
-					APVN = APV[IJN]*FYN + APV[IJ]*FYP;
+					VNL = V[IJN] * FYN + V[IJ] * FYP;
+					APVN = APV[IJN] * FYN + APV[IJ] * FYP;
 
 					/* CELL-FACE GRADIENT, VELOCITY AND MASS FLUX */
 
@@ -1442,13 +1590,20 @@ int _tmain(int argc, _TCHAR* argv[])
 				{
 					LW[IJ] = AW[IJ] / (1.0 + ALFA*UN[IJ - NJ]);
 					LS[IJ] = AS[IJ] / (1.0 + ALFA*UE[IJ - 1]);
-					P1 = ALFA*LW[IJ]*UN[IJ - NJ];
-					P2 = ALFA*LS[IJ]*UE[IJ - 1];
-					LPR[IJ] = 1.0 / (AP[IJ] + P1 + P2 - LW[IJ]*UE[IJ - NJ] - LS[IJ]*UN[IJ - 1]);
+					P1 = ALFA*LW[IJ] * UN[IJ - NJ];
+					P2 = ALFA*LS[IJ] * UE[IJ - 1];
+					LPR[IJ] = 1.0 / (AP[IJ] + P1 + P2 - LW[IJ] * UE[IJ - NJ] - LS[IJ] * UN[IJ - 1]);
 					UN[IJ] = (AN[IJ] - P1)*LPR[IJ];
 					UE[IJ] = (AE[IJ] - P2)*LPR[IJ];
 				}
 			}
+
+			cudaMemcpy(D_LS, LS, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_LW, LW, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_UN, UN, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_UE, UE, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_LPR, LPR, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_PP, PP, NIJ*sizeof(double), cudaMemcpyHostToDevice);
 
 			/* INNER ITERATIONS LOOP*/
 
@@ -1462,29 +1617,37 @@ int _tmain(int argc, _TCHAR* argv[])
 				{
 					int Start = (LI[I] + 1);
 					int End = (LI[I] + NJM);
-#pragma omp parallel for reduction (+:RESL)
+
 					for (int IJ = Start; IJ < End; ++IJ)
 					{
-						RES[IJ] = SU[IJ] - AN[IJ]*PP[IJ + 1] - AS[IJ]*PP[IJ - 1] -
-							AE[IJ]*PP[IJ + NJ] - AW[IJ]*PP[IJ - NJ] - AP[IJ]*PP[IJ];
+						RES[IJ] = SU[IJ] - AN[IJ] * PP[IJ + 1] - AS[IJ] * PP[IJ - 1] -
+							AE[IJ] * PP[IJ + NJ] - AW[IJ] * PP[IJ - NJ] - AP[IJ] * PP[IJ];
 						double ABS = abs(RES[IJ]);
 						RESL += ABS;
 					}
 				}
 
-				for (int J = 2; J <= (NI + NI - 2); ++J)
+				cudaMemcpy(D_RES, RES, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+
+				int threads;
+
+				/*for (int J = 2; J <= (NI + NI - 2); ++J)
 				{
-					int Start = max(1, J - NI + 2);
-					int End = min(NI - 2, J - 1);
+				int Start = max(1, J - NI + 2);
+				int End = min(NI - 2, J - 1);
 
-#pragma omp parallel for if ((End-Start)>50) 
-					for (int I = Start; I <= End; ++I)
-					{
-						int IJ = (I*NI) + (J - I);
-						RES[IJ] = (RES[IJ] - LS[IJ]*RES[IJ - 1] - LW[IJ]*RES[IJ - NJ])*LPR[IJ];
-					}
+				threads = End - Start + 1;
+				dim3 block(thrds);
+				dim3 grid((threads + block.x - 1) / block.x);
+
+				if ((End - Start + 1) > 0)
+				{
+				Forwardsub << <grid, block >> >(D_RES, D_LS, D_LW, D_LPR, NI, NJ, Start, J, threads);
+				cudaDeviceSynchronize();
 				}
+				}*/
 
+				Forward << <1, 1 >> >(D_RES, D_LS, D_LW, D_LPR, NI, NJ, thrds);
 
 				/* STORE INITIAL RESIDUAL SUM FOR CHECKING CONV. OF OUTER ITER. */
 
@@ -1497,19 +1660,36 @@ int _tmain(int argc, _TCHAR* argv[])
 
 				/* BACK SUBSTITUTION AND CORRECTION */
 
-				for (int J = (NI + NI - 2); J >= 2; --J)
+				/*for (int J = (NI + NI - 2); J >= 2; --J)
 				{
-					int Start = max(1, J - NI + 2);
-					int End = min(NI - 2, J - 1);
+				int Start = max(1, J - NI + 2);
+				int End = min(NI - 2, J - 1);
 
-#pragma omp parallel for if ((End-Start)>50)
-					for (int I = End; I >= Start; --I)
-					{
-						int IJ = (I*NI) + (J - I);
-						RES[IJ] = RES[IJ] - UN[IJ]*RES[IJ + 1] - UE[IJ]*RES[IJ + NJ];
-						PP[IJ] = PP[IJ] + RES[IJ];
-					}
-				}				
+				threads = End - Start + 1;
+				dim3 block(thrds);
+				dim3 grid((threads + block.x - 1) / block.x);
+
+				if ((End - Start + 1) > 0)
+				{
+				Backwardsub << <grid, block >> >(D_PP, D_RES, D_UN, D_UE, D_LPR, NI, NJ, End, J, threads);
+				cudaDeviceSynchronize();
+				}
+				}*/
+
+				Backward << <1, 1 >> >(D_PP, D_RES, D_UN, D_UE, D_LPR, NI, NJ, thrds);
+
+				cudaMemcpy(PP, D_PP, NIJ*sizeof(double), cudaMemcpyDeviceToHost);
+
+				/*for (int I = (NIM - 1); I > 0; --I)
+				{
+				int Start = (LI[I] + NJM - 1);
+				int End = (LI[I] + 1);
+
+				for (int IJ = Start; IJ >= End; --IJ)
+				{
+				PP[IJ] = PP[IJ] + RES[IJ];
+				}
+				}*/
 
 				RSMP = RESOR;
 
@@ -1575,7 +1755,7 @@ int _tmain(int argc, _TCHAR* argv[])
 			{
 				for (int IJ = (LI[I] + 1); IJ < (LI[I] + NJM); ++IJ)
 				{
-					F1[IJ] = F1[IJ] + AE[IJ]*(PP[IJ + NJ] - PP[IJ]);
+					F1[IJ] = F1[IJ] + AE[IJ] * (PP[IJ + NJ] - PP[IJ]);
 				}
 			}
 
@@ -1585,7 +1765,7 @@ int _tmain(int argc, _TCHAR* argv[])
 			{
 				for (int IJ = (LI[I] + 1); IJ < (LI[I] + NIM - 1); ++IJ)
 				{
-					F2[IJ] = F2[IJ] + AN[IJ]*(PP[IJ + 1] - PP[IJ]);
+					F2[IJ] = F2[IJ] + AN[IJ] * (PP[IJ + 1] - PP[IJ]);
 				}
 			}
 
@@ -1601,10 +1781,10 @@ int _tmain(int argc, _TCHAR* argv[])
 					RP = 0.5*(R[J] + R[J - 1]);
 					DY = Y[J] - Y[J - 1];
 
-					PPE = PP[IJ + NJ]*FX[I] + PP[IJ]*(1.0 - FX[I]);
-					PPW = PP[IJ]*FX[I - 1] + PP[IJ - NJ]*(1.0 - FX[I - 1]);
-					PPN = PP[IJ + 1]*FY[J] + PP[IJ]*(1.0 - FY[J]);
-					PPS = PP[IJ]*FY[J - 1] + PP[IJ - 1]*(1.0 - FY[J - 1]);
+					PPE = PP[IJ + NJ] * FX[I] + PP[IJ] * (1.0 - FX[I]);
+					PPW = PP[IJ] * FX[I - 1] + PP[IJ - NJ] * (1.0 - FX[I - 1]);
+					PPN = PP[IJ + 1] * FY[J] + PP[IJ] * (1.0 - FY[J]);
+					PPS = PP[IJ] * FY[J - 1] + PP[IJ - 1] * (1.0 - FY[J - 1]);
 
 					U[IJ] = U[IJ] - (PPE - PPW)*DY*RP*APU[IJ];
 					V[IJ] = V[IJ] - (PPN - PPS)*DX*RP*APV[IJ];
@@ -1665,7 +1845,7 @@ int _tmain(int argc, _TCHAR* argv[])
 					CP = max(F1[IJ], 0.0);
 
 					FUDS = CP*T[IJ] + CE*T[IJE];
-					FCDS = F1[IJ]*(T[IJE]*FXE + T[IJ]*FXP);
+					FCDS = F1[IJ] * (T[IJE] * FXE + T[IJ] * FXP);
 
 					/* COEFFICIENTS AE(P) AND AW(E) DUE TO UDS */
 
@@ -1708,7 +1888,7 @@ int _tmain(int argc, _TCHAR* argv[])
 					CP = max(F2[IJ], 0.);
 
 					FUDS = CP*T[IJ] + CN*T[IJN];
-					FCDS = F2[IJ]*(T[IJN]*FYN + T[IJ]*FYP);
+					FCDS = F2[IJ] * (T[IJN] * FYN + T[IJ] * FYP);
 
 					/* COEFFICIENTS AE(P) AND AW(E) DUE TO UDS */
 
@@ -1803,7 +1983,7 @@ int _tmain(int argc, _TCHAR* argv[])
 				for (int IJ = (LI[I] + 1); IJ < (LI[I] + NJM); ++IJ)
 				{
 					AP[IJ] = (AP[IJ] - AW[IJ] - AE[IJ] - AN[IJ] - AS[IJ])*URFTR;
-					SU[IJ] = SU[IJ] + (1.0 - URFT)*AP[IJ]*T[IJ];
+					SU[IJ] = SU[IJ] + (1.0 - URFT)*AP[IJ] * T[IJ];
 				}
 			}
 
@@ -1828,13 +2008,20 @@ int _tmain(int argc, _TCHAR* argv[])
 				{
 					LW[IJ] = AW[IJ] / (1.0 + ALFA*UN[IJ - NJ]);
 					LS[IJ] = AS[IJ] / (1.0 + ALFA*UE[IJ - 1]);
-					P1 = ALFA*LW[IJ]*UN[IJ - NJ];
-					P2 = ALFA*LS[IJ]*UE[IJ - 1];
-					LPR[IJ] = 1.0 / (AP[IJ] + P1 + P2 - LW[IJ]*UE[IJ - NJ] - LS[IJ]*UN[IJ - 1]);
+					P1 = ALFA*LW[IJ] * UN[IJ - NJ];
+					P2 = ALFA*LS[IJ] * UE[IJ - 1];
+					LPR[IJ] = 1.0 / (AP[IJ] + P1 + P2 - LW[IJ] * UE[IJ - NJ] - LS[IJ] * UN[IJ - 1]);
 					UN[IJ] = (AN[IJ] - P1)*LPR[IJ];
 					UE[IJ] = (AE[IJ] - P2)*LPR[IJ];
 				}
 			}
+
+			cudaMemcpy(D_LS, LS, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_LW, LW, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_UN, UN, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_UE, UE, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_LPR, LPR, NIJ*sizeof(double), cudaMemcpyHostToDevice);
+			cudaMemcpy(D_T, T, NIJ*sizeof(double), cudaMemcpyHostToDevice);
 
 			/* INNER ITERATIONS LOOP*/
 
@@ -1848,28 +2035,37 @@ int _tmain(int argc, _TCHAR* argv[])
 				{
 					int Start = (LI[I] + 1);
 					int End = (LI[I] + NJM);
-#pragma omp parallel for reduction (+:RESL)
+
 					for (int IJ = Start; IJ < End; ++IJ)
 					{
-						RES[IJ] = SU[IJ] - AN[IJ]*T[IJ + 1] - AS[IJ]*T[IJ - 1] -
-							AE[IJ]*T[IJ + NJ] - AW[IJ]*T[IJ - NJ] - AP[IJ]*T[IJ];
+						RES[IJ] = SU[IJ] - AN[IJ] * T[IJ + 1] - AS[IJ] * T[IJ - 1] -
+							AE[IJ] * T[IJ + NJ] - AW[IJ] * T[IJ - NJ] - AP[IJ] * T[IJ];
 						double ABS = abs(RES[IJ]);
 						RESL += ABS;
 					}
 				}
 
-				for (int J = 2; J <= (NI + NI - 2); ++J)
-				{
-					int Start = max(1, J - NI + 2);
-					int End = min(NI - 2, J - 1);
+				cudaMemcpy(D_RES, RES, NIJ*sizeof(double), cudaMemcpyHostToDevice);
 
-#pragma omp parallel for if ((End-Start)>50) 
-					for (int I = Start; I <= End; ++I)
-					{
-						int IJ = (I*NI) + (J - I);
-						RES[IJ] = (RES[IJ] - LS[IJ]*RES[IJ - 1] - LW[IJ]*RES[IJ - NJ])*LPR[IJ];
-					}
+				int threads;
+
+				/*for (int J = 2; J <= (NI + NI - 2); ++J)
+				{
+				int Start = max(1, J - NI + 2);
+				int End = min(NI - 2, J - 1);
+
+				threads = End - Start + 1;
+				dim3 block(thrds);
+				dim3 grid((threads + block.x - 1) / block.x);
+
+				if ((End - Start + 1) > 0)
+				{
+				Forwardsub << <grid, block >> >(D_RES, D_LS, D_LW, D_LPR, NI, NJ, Start, J, threads);
+				cudaDeviceSynchronize();
 				}
+				}*/
+
+				Forward << <1, 1 >> >(D_RES, D_LS, D_LW, D_LPR, NI, NJ, thrds);
 
 
 				/* STORE INITIAL RESIDUAL SUM FOR CHECKING CONV. OF OUTER ITER. */
@@ -1883,21 +2079,36 @@ int _tmain(int argc, _TCHAR* argv[])
 
 				/* BACK SUBSTITUTION AND CORRECTION */
 
-				for (int J = (NI + NI - 2); J >= 2; --J)
+				/*for (int J = (NI + NI - 2); J >= 2; --J)
 				{
-					int Start = max(1, J - NI + 2);
-					int End = min(NI - 2, J - 1);
+				int Start = max(1, J - NI + 2);
+				int End = min(NI - 2, J - 1);
 
-#pragma omp parallel for if ((End-Start)>50)
-					for (int I = End; I >= Start; --I)
-					{
-						int IJ = (I*NI) + (J - I);
-						RES[IJ] = RES[IJ] - UN[IJ]*RES[IJ + 1] - UE[IJ]*RES[IJ + NJ];
-						T[IJ] = T[IJ] + RES[IJ];
-					}
+				threads = End - Start + 1;
+				dim3 block(thrds);
+				dim3 grid((threads + block.x - 1) / block.x);
+
+				if ((End - Start + 1) > 0)
+				{
+				Backwardsub << <grid, block >> >(D_T, D_RES, D_UN, D_UE, D_LPR, NI, NJ, End, J, threads);
+				cudaDeviceSynchronize();
 				}
+				}*/
 
-				
+				Backward << <1, 1 >> >(D_T, D_RES, D_UN, D_UE, D_LPR, NI, NJ, thrds);
+
+				cudaMemcpy(T, D_T, NIJ*sizeof(double), cudaMemcpyDeviceToHost);
+
+				/*for (int I = (NIM - 1); I > 0; --I)
+				{
+				int Start = (LI[I] + NJM - 1);
+				int End = (LI[I] + 1);
+
+				for (int IJ = Start; IJ >= End; --IJ)
+				{
+				T[IJ] = T[IJ] + RES[IJ];
+				}
+				}*/
 
 				RSMT = RESOR;
 
@@ -1936,9 +2147,9 @@ int _tmain(int argc, _TCHAR* argv[])
 
 
 			////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-			SOURCE = max(max(RSMU, RSMV), max(RSMP, RSMT));
-
+			//
+			//			SOURCE = max(max(RSMU, RSMV), max(RSMP, RSMT));
+			SOURCE = RSMU;
 			if (SOURCE < RESMAX)
 			{
 				outputfile << endl << "Outer Iteration Converged after: " << ITER + 1 << " Iterations" << endl;
@@ -2053,7 +2264,7 @@ int _tmain(int argc, _TCHAR* argv[])
 		resultfile << "I=" << NIM << ", " << "J=" << NJM << endl;
 		resultfile << "ZONETYPE=Ordered" << endl;
 		resultfile << "DATAPACKING=POINT" << endl;
-		resultfile << "DT=(LONGINT LONGINT DOUBLE DOUBLE DOUBLE DOUBLE )" << endl << endl;
+		resultfile << "DT=(LONGINT LONGINT double double double double )" << endl << endl;
 
 		for (int I = 1; I < NI; ++I)
 		{
@@ -2072,97 +2283,97 @@ int _tmain(int argc, _TCHAR* argv[])
 	}
 
 
-	int IPSIMAX, JPSIMAX, IPSIMIN, JPSIMIN;
+	//int IPSIMAX, JPSIMAX, IPSIMIN, JPSIMIN;
 
-	/* STREAMFUNCTION VALUES AT CV-VERTICES (ZERO AT SOUTH-WEST CORNER) */
+	///* STREAMFUNCTION VALUES AT CV-VERTICES (ZERO AT SOUTH-WEST CORNER) */
 
-	PP[LI[0] + 1] = 0.0;
+	//PP[LI[0] + 1] = 0.0;
 
-	/* WEST BOUNDARY (APPLICABLE FOR INLET OR OUTLET) */
+	///* WEST BOUNDARY (APPLICABLE FOR INLET OR OUTLET) */
 
-	for (int J = 1; J < NJM; ++J)
-	{
-		int IJ = LI[0] + J;
-		PP[IJ] = PP[IJ - 1] - F1[IJ];
-	}
+	//for (int J = 1; J < NJM; ++J)
+	//{
+	//	int IJ = LI[0] + J;
+	//	PP[IJ] = PP[IJ - 1] - F1[IJ];
+	//}
 
-	/* SOUTH BOUNDARY (APPLICABLE FOR INLET OR OUTLET) */
+	///* SOUTH BOUNDARY (APPLICABLE FOR INLET OR OUTLET) */
 
-	for (int I = 1; I < NIM; ++I)
-	{
-		int IJ = LI[I] + 1;
-		PP[IJ] = PP[IJ] - F2[IJ];
+	//for (int I = 1; I < NIM; ++I)
+	//{
+	//	int IJ = LI[I] + 1;
+	//	PP[IJ] = PP[IJ] - F2[IJ];
 
-		/* Inner Region */
-		for (int J = 1; J < NJM; ++J)
-		{
-			int IJ = LI[I] + J;
-			PP[IJ] = PP[IJ - 1] - F1[IJ];
-		}
-	}
+	//	/* Inner Region */
+	//	for (int J = 1; J < NJM; ++J)
+	//	{
+	//		int IJ = LI[I] + J;
+	//		PP[IJ] = PP[IJ - 1] - F1[IJ];
+	//	}
+	//}
 
-	/* STRENGTH OF PRIMARY AND SECONDARY EDDY (MIN and MAX values) */
+	///* STRENGTH OF PRIMARY AND SECONDARY EDDY (MIN and MAX values) */
 
-	double UIJ, VIJ, Unorth, Usouth, Veast, Vwest;
-	double OmegaMAX, OmegaMIN, DUDY, DVDX;
-	double PRIPSI, PRIOMEGA, PRII, PRIJ;
-	double BR1PSI, BR1OMEGA, BR1I, BR1J;
-	double BR2PSI, BR2OMEGA, BR2I, BR2J;
-	double BR3PSI, BR3OMEGA, BR3I, BR3J;
-	double BL1PSI, BL1OMEGA, BL1I, BL1J;
-	double BL2PSI, BL2OMEGA, BL2I, BL2J;
-	double BL3PSI, BL3OMEGA, BL3I, BL3J;
-	double TL1PSI, TL1OMEGA, TL1I, TL1J;
-	double TL2PSI, TL2OMEGA, TL2I, TL2J;
+	//double UIJ, VIJ, Unorth, Usouth, Veast, Vwest;
+	//double OmegaMAX, OmegaMIN, DUDY, DVDX;
+	//double PRIPSI, PRIOMEGA, PRII, PRIJ;
+	//double BR1PSI, BR1OMEGA, BR1I, BR1J;
+	//double BR2PSI, BR2OMEGA, BR2I, BR2J;
+	//double BR3PSI, BR3OMEGA, BR3I, BR3J;
+	//double BL1PSI, BL1OMEGA, BL1I, BL1J;
+	//double BL2PSI, BL2OMEGA, BL2I, BL2J;
+	//double BL3PSI, BL3OMEGA, BL3I, BL3J;
+	//double TL1PSI, TL1OMEGA, TL1I, TL1J;
+	//double TL2PSI, TL2OMEGA, TL2I, TL2J;
 
-	double PSIMAX = PRIPSI = BR2PSI = BL1PSI = TL1PSI = SMALL;
-	double PSIMIN = BR1PSI = BR3PSI = BL2PSI = TL2PSI = LARGE;
+	//double PSIMAX = PRIPSI = BR2PSI = BL1PSI = TL1PSI = SMALL;
+	//double PSIMIN = BR1PSI = BR3PSI = BL2PSI = TL2PSI = LARGE;
 
-	/* Search for Psi, Omega Over the entire domain "Primary, and BR1" */
+	///* Search for Psi, Omega Over the entire domain "Primary, and BR1" */
 
-	for (int I = 0; I < NIM; ++I)
-	{
-		for (int J = 0; J < NJM; ++J)
-		{
-			int IJ = LI[I] + J;
+	//for (int I = 0; I < NIM; ++I)
+	//{
+	//	for (int J = 0; J < NJM; ++J)
+	//	{
+	//		int IJ = LI[I] + J;
 
-			if (PP[IJ] < BR1PSI)
-			{
-				BR1PSI = PP[IJ];
-				BR1I = I;
-				BR1J = J;
-				Unorth = U[IJ + 1];
-				Usouth = U[IJ - 1];
-				Veast = V[LI[I + 1] + J];
-				Vwest = V[LI[I - 1] + J];
-				DUDY = (Unorth - Usouth) * 0.5 * M;
-				DVDX = (Veast - Vwest) * 0.5 * N;
-				BR1OMEGA = DVDX - DUDY;
-			}
+	//		if (PP[IJ] < BR1PSI)
+	//		{
+	//			BR1PSI = PP[IJ];
+	//			BR1I = I;
+	//			BR1J = J;
+	//			Unorth = U[IJ + 1];
+	//			Usouth = U[IJ - 1];
+	//			Veast = V[LI[I + 1] + J];
+	//			Vwest = V[LI[I - 1] + J];
+	//			DUDY = (Unorth - Usouth) * 0.5 * M;
+	//			DVDX = (Veast - Vwest) * 0.5 * N;
+	//			BR1OMEGA = DVDX - DUDY;
+	//		}
 
-			if (PP[IJ] > PRIPSI)
-			{
-				PRIPSI = PP[IJ];
-				PRII = I;
-				PRIJ = J;
-				Unorth = U[IJ + 1];
-				Usouth = U[IJ - 1];
-				Veast = V[LI[I + 1] + J];
-				Vwest = V[LI[I - 1] + J];
-				DUDY = (Unorth - Usouth)*0.5*M;
-				DVDX = (Veast - Vwest)*0.5*N;
-				PRIOMEGA = DVDX - DUDY;
-			}
-		}
-	}
+	//		if (PP[IJ] > PRIPSI)
+	//		{
+	//			PRIPSI = PP[IJ];
+	//			PRII = I;
+	//			PRIJ = J;
+	//			Unorth = U[IJ + 1];
+	//			Usouth = U[IJ - 1];
+	//			Veast = V[LI[I + 1] + J];
+	//			Vwest = V[LI[I - 1] + J];
+	//			DUDY = (Unorth - Usouth)*0.5*M;
+	//			DVDX = (Veast - Vwest)*0.5*N;
+	//			PRIOMEGA = DVDX - DUDY;
+	//		}
+	//	}
+	//}
 
-	outputfile << endl << endl;
-	outputfile << "Strenght of The Primary Vortex : "
-		<< setw(10) << left << fixed << setprecision(6) << PRIPSI << endl;
-	outputfile << "Location X: " << setw(8) << left << fixed << setprecision(6) << PRII*DY << endl;
-	outputfile << "Location Y: " << setw(8) << left << fixed << setprecision(6) << PRIJ*DX << endl;
-	outputfile << "OmegaMax: " << setw(8) << left << fixed << setprecision(6) << PRIOMEGA << endl;
-	outputfile << endl << endl;
+	//outputfile << endl << endl;
+	//outputfile << "Strenght of The Primary Vortex : "
+	//	<< setw(10) << left << fixed << setprecision(6) << PRIPSI << endl;
+	//outputfile << "Location X: " << setw(8) << left << fixed << setprecision(6) << PRII*DY << endl;
+	//outputfile << "Location Y: " << setw(8) << left << fixed << setprecision(6) << PRIJ*DX << endl;
+	//outputfile << "OmegaMax: " << setw(8) << left << fixed << setprecision(6) << PRIOMEGA << endl;
+	//outputfile << endl << endl;
 
 	//outputfile << "Strenght of The BR1 Vortex : "
 	//	<< setw(10) << left << fixed << setprecision(6) << BR1PSI << endl;
@@ -2340,7 +2551,7 @@ int _tmain(int argc, _TCHAR* argv[])
 	/*double *HORVORTICITY, *VERVORTICITY;
 	HORVORTICITY = (double*)malloc(NIM*sizeof(double));
 	VERVORTICITY = (double*)malloc(NJM*sizeof(double));*/
-	
+
 
 	///* Vorticity Valuse across a Horizontal line passing through the geometric center of the domain */
 
@@ -2398,36 +2609,48 @@ int _tmain(int argc, _TCHAR* argv[])
 	//		<< setw(18) << fixed << setprecision(12) << left << setfill('0') << VERVORTICITY(J) << "     " << endl << endl;
 	//}
 
-free(X);
-free(XC);
-free(Y);
-free(YC);
-free(LI);
-free(U);
-free(V);
-free(P);
-free(T);
-free(PP);
-free(UO);
-free(VO);
-free(PO);
-free(TO);
-free(UOO);
-free(VOO);
-free(POO);
-free(TOO);
-free(AE);
-free(AW);
-free(AN);
-free(AS);
-free(AP);
-free(LW);
-free(LS);
-free(UN);
-free(UE);
-free(RES);
-free(LES);
-free(LPR);
+
+
+	free(X);
+	free(XC);
+	free(Y);
+	free(YC);
+	free(LI);
+	free(U);
+	free(V);
+	free(P);
+	free(T);
+	free(PP);
+	free(UO);
+	free(VO);
+	free(PO);
+	free(TO);
+	free(UOO);
+	free(VOO);
+	free(POO);
+	free(TOO);
+	free(AE);
+	free(AW);
+	free(AN);
+	free(AS);
+	free(AP);
+	free(LW);
+	free(LS);
+	free(UN);
+	free(UE);
+	free(RES);
+	free(LES);
+	free(LPR);
+
+
+	cudaFree(D_RES);
+	cudaFree(D_LS);
+	cudaFree(D_LW);
+	cudaFree(D_UN);
+	cudaFree(D_UE);
+	cudaFree(D_LPR);
+
+	cudaDeviceReset();
 
 	return 0;
 }
