@@ -17,3 +17,7 @@ using the Finite Volume Method (FVM) in primitive variables formulation.
 Convective terms are discretized using second order central differencing scheme,
 and SIMPLE algorithm are used to decouple velocity and pressure.
 Strongly Implicit Procedure was used to solve the resulted linear algebraic equations.
+
+Changelog
+---------
+15/07/2016 3.11 PM  --> A sample input, output and executable file have been aded
